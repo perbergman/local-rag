@@ -186,70 +186,308 @@ func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	return nil
 }
 
-// findCodeFiles recursively finds all code files in a directory
+// findCodeFiles recursively finds all code files in a directory with comprehensive filtering
 func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 	var files []string
 	
-	// Extensions to include
+	// Extensions to include - expanded list of code file extensions
 	extensions := map[string]bool{
-		".go":   true,
-		".py":   true,
-		".js":   true,
-		".ts":   true,
-		".java": true,
-		".c":    true,
-		".cpp":  true,
-		".h":    true,
-		".cs":   true,
-		".php":  true,
-		".rb":   true,
-		".rs":   true,
+		// Programming languages
+		".go":    true,
+		".py":    true,
+		".js":    true,
+		".jsx":   true,
+		".ts":    true,
+		".tsx":   true,
+		".java":  true,
+		".c":     true,
+		".cpp":   true,
+		".cc":    true,
+		".cxx":   true,
+		".h":     true,
+		".hpp":   true,
+		".hxx":   true,
+		".cs":    true,
+		".php":   true,
+		".rb":    true,
+		".rs":    true,
 		".swift": true,
-		".kt":   true,
-		".sh":   true,
-		".html": true,
-		".css":  true,
-		".sql":  true,
-		".md":   true,
+		".kt":    true,
+		".scala": true,
+		".pl":    true,
+		".pm":    true,
+		".r":     true,
+		".lua":   true,
+		".groovy":true,
+		".dart":  true,
+		".elm":   true,
+		".ex":    true,
+		".exs":   true,
+		".erl":   true,
+		".hrl":   true,
+		".clj":   true,
+		".hs":    true,
+		".fs":    true,
+		".fsx":   true,
+		".ml":    true,
+		".mli":   true,
+		
+		// Shell scripts
+		".sh":    true,
+		".bash":  true,
+		".zsh":   true,
+		".fish":  true,
+		".ps1":   true,
+		".bat":   true,
+		".cmd":   true,
+		
+		// Web development
+		".html":  true,
+		".htm":   true,
+		".xhtml": true,
+		".css":   true,
+		".scss":  true,
+		".sass":  true,
+		".less":  true,
+		".vue":   true,
+		".svelte":true,
+		
+		// Data and config files
+		".json":  true,
+		".yaml":  true,
+		".yml":   true,
+		".xml":   true,
+		".toml":  true,
+		".ini":   true,
+		".sql":   true,
+		".graphql":true,
+		".proto": true,
+		
+		// Documentation
+		".md":    true,
+		".rst":   true,
+		".tex":   true,
+		".adoc":  true,
 	}
 	
-	// Patterns to ignore
-	ignorePatterns := []string{
-		"node_modules",
-		"vendor",
-		".git",
-		".venv",
-		"__pycache__",
-		"dist",
-		"build",
-		".idea",
-		".vscode",
+	// Directories to ignore - expanded with more common patterns
+	ignoreDirs := map[string]bool{
+		// Package managers and dependencies
+		"node_modules":    true,
+		"vendor":          true,
+		"bower_components":true,
+		"jspm_packages":   true,
+		"packages":        true,
+		
+		// Version control
+		".git":            true,
+		".svn":            true,
+		".hg":             true,
+		".bzr":            true,
+		
+		// Virtual environments
+		".venv":           true,
+		"venv":            true,
+		"env":             true,
+		".env":            true,
+		"virtualenv":      true,
+		"__pycache__":     true,
+		"site-packages":   true,
+		
+		// Build and distribution
+		"dist":            true,
+		"build":           true,
+		"out":             true,
+		"bin":             true,
+		"target":          true,
+		"output":          true,
+		"release":         true,
+		"debug":           true,
+		
+		// IDE and editor
+		".idea":           true,
+		".vscode":         true,
+		".vs":             true,
+		".eclipse":        true,
+		".settings":       true,
+		
+		// Temporary and cache
+		"tmp":             true,
+		"temp":            true,
+		"cache":           true,
+		".cache":          true,
+		".sass-cache":     true,
+		
+		// Documentation
+		"docs":            true,
+		"doc":             true,
+		
+		// Test coverage
+		"coverage":        true,
+		".nyc_output":     true,
+		".coverage":       true,
+		"htmlcov":         true,
+		
+		// Logs
+		"logs":            true,
+		"log":             true,
 	}
+	
+	// Files to ignore (by pattern)
+	ignoreFilePatterns := []string{
+		// Minified files
+		"*.min.js",
+		"*.min.css",
+		
+		// Generated files
+		"*.generated.*",
+		"*_generated.*",
+		"*.g.*",
+		"*.pb.*",
+		
+		// Compiled binaries
+		"*.exe",
+		"*.dll",
+		"*.so",
+		"*.dylib",
+		"*.class",
+		"*.o",
+		"*.obj",
+		"*.a",
+		"*.lib",
+		"*.pyc",
+		"*.pyo",
+		
+		// Archives
+		"*.zip",
+		"*.tar",
+		"*.gz",
+		"*.bz2",
+		"*.xz",
+		"*.rar",
+		"*.7z",
+		
+		// Media files
+		"*.jpg", "*.jpeg",
+		"*.png",
+		"*.gif",
+		"*.bmp",
+		"*.ico",
+		"*.svg",
+		"*.webp",
+		"*.mp3",
+		"*.mp4",
+		"*.wav",
+		"*.avi",
+		"*.mov",
+		"*.webm",
+		
+		// Lock files
+		"*.lock",
+		"package-lock.json",
+		"yarn.lock",
+		"Cargo.lock",
+		
+		// Backup files
+		"*~",
+		"*.bak",
+		"*.swp",
+		"*.swo",
+		
+		// Large data files
+		"*.csv",
+		"*.tsv",
+		"*.db",
+		"*.sqlite",
+		"*.sqlite3",
+		
+		// Logs
+		"*.log",
+	}
+	
+	// Maximum file size to process (1MB)
+	maxFileSize := int64(1 * 1024 * 1024)
+	
+	r.logger.Printf("Starting file indexing with enhanced filtering from root: %s\n", root)
 	
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			r.logger.Printf("Error accessing path %s: %v\n", path, err)
+			return nil // Continue walking despite the error
 		}
 		
-		// Skip if directory matches ignore pattern
+		// Skip if file is too large
+		if !info.IsDir() && info.Size() > maxFileSize {
+			r.logger.Printf("Skipping large file: %s (%.2f MB)\n", path, float64(info.Size())/(1024*1024))
+			return nil
+		}
+		
+		// Handle directories
 		if info.IsDir() {
-			for _, pattern := range ignorePatterns {
-				if strings.Contains(path, pattern) {
+			// Check if we should skip this directory
+			baseName := filepath.Base(path)
+			
+			// Skip hidden directories (starting with .)
+			if strings.HasPrefix(baseName, ".") && baseName != "." && baseName != ".." {
+				return filepath.SkipDir
+			}
+			
+			// Check for direct matches with excluded directories
+			if ignoreDirs[baseName] {
+				r.logger.Printf("Skipping directory: %s\n", path)
+				return filepath.SkipDir
+			}
+			
+			// Check for path components that should be skipped
+			pathParts := strings.Split(path, string(os.PathSeparator))
+			for _, part := range pathParts {
+				if ignoreDirs[part] {
+					r.logger.Printf("Skipping directory path containing %s: %s\n", part, path)
 					return filepath.SkipDir
 				}
 			}
+			
+			// Check for virtual environment paths
+			if (strings.Contains(path, "venv/lib/python") && strings.Contains(path, "site-packages")) ||
+			   (strings.Contains(path, "env/lib/python") && strings.Contains(path, "site-packages")) {
+				r.logger.Printf("Skipping Python virtual environment path: %s\n", path)
+				return filepath.SkipDir
+			}
+			
 			return nil
+		}
+		
+		// Handle files
+		fileName := filepath.Base(path)
+		
+		// Skip hidden files
+		if strings.HasPrefix(fileName, ".") {
+			return nil
+		}
+		
+		// Skip files matching ignore patterns
+		for _, pattern := range ignoreFilePatterns {
+			matched, err := filepath.Match(pattern, fileName)
+			if err != nil {
+				r.logger.Printf("Error matching pattern %s: %v\n", pattern, err)
+				continue
+			}
+			if matched {
+				return nil
+			}
 		}
 		
 		// Check if file extension is one we want to process
 		ext := strings.ToLower(filepath.Ext(path))
 		if extensions[ext] {
+			r.logger.Printf("Including file: %s\n", path)
 			files = append(files, path)
 		}
 		
 		return nil
 	})
 	
+	r.logger.Printf("File filtering complete. Found %d files to process\n", len(files))
 	return files, err
 }
 
