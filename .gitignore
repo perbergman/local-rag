@@ -1,0 +1,58 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Local environment files
+.env
+.env.local
+
+# Build output directories
+bin/
+build/
+dist/
+
+# Log files
+*.log
+
+# Neo4j data and logs
+neo4j/data/
+neo4j/logs/
+neo4j/import/
+neo4j/conf/
+neo4j/plugins/
+
+# Database dumps and backups
+*.dump
+*.backup
+*.archive

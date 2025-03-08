@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  # Neo4j database
+  neo4j:
+    image: neo4j:4.4
+    container_name: rag-neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4JLABS_PLUGINS=["apoc", "graph-data-science"]
+    volumes:
+      - ./neo4j/data:/data
+      - ./neo4j/logs:/logs
+      - ./neo4j/import:/import
+      - ./neo4j/plugins:/plugins
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  # Embedding service
+  embedding-service:
+    build: 
+      context: ./embedding
+      dockerfile: Dockerfile
+    container_name: rag-embedding
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./embedding:/app
+      - embedding-cache:/root/.cache
+    environment:
+      - MODEL_NAME=all-MiniLM-L6-v2
+    command: python embedding_service.py --model ${MODEL_NAME:-all-MiniLM-L6-v2} --host 0.0.0.0 --port 8080
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  # LMStudio connector service
+  lmstudio-connector:
+    build:
+      context: ./lmstudio-connector
+      dockerfile: Dockerfile
+    container_name: rag-lmstudio-connector
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./lmstudio-connector:/app
+    environment:
+      - LMSTUDIO_URL=http://host.docker.internal:1234
+    command: python lmstudio_connector.py --lmstudio-url ${LMSTUDIO_URL:-http://host.docker.internal:1234} --host 0.0.0.0 --port 8081
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  embedding-cache:
