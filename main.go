@@ -14,8 +14,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
@@ -158,7 +160,7 @@ func (r *Neo4jRAG) initDatabase() error {
 	return nil
 }
 
-// IndexDirectory indexes a directory of code
+// IndexDirectory indexes a directory of code using parallel processing
 func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	r.logger.Printf("Indexing directory: %s\n", dir)
 	
@@ -170,19 +172,68 @@ func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	
 	r.logger.Printf("Found %d files to index\n", len(files))
 	
-	// Process each file
-	for i, file := range files {
-		if i%100 == 0 && i > 0 {
-			r.logger.Printf("Processed %d/%d files\n", i, len(files))
-		}
-		
-		err := r.processFile(file, dir)
-		if err != nil {
-			r.logger.Printf("Error processing file %s: %v\n", file, err)
-		}
+	// Use parallel processing with worker pool for large codebases
+	workerCount := runtime.NumCPU() // Use number of available CPUs
+	r.logger.Printf("Using %d parallel workers for indexing\n", workerCount)
+	
+	// Create a channel for files to process
+	filesChan := make(chan string, len(files))
+	
+	// Create a wait group to wait for all workers to finish
+	var wg sync.WaitGroup
+	
+	// Create a mutex for thread-safe logging and counting
+	var logMutex sync.Mutex
+	processedCount := 0
+	errorCount := 0
+	
+	// Start worker goroutines
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func(workerId int) {
+			defer wg.Done()
+			
+			for file := range filesChan {
+				// Process the file
+				err := r.processFile(file, dir)
+				
+				// Update counters with mutex protection
+				logMutex.Lock()
+				processedCount++
+				if err != nil {
+					errorCount++
+					r.logger.Printf("Worker %d: Error processing file %s: %v\n", workerId, file, err)
+				}
+				
+				// Log progress periodically
+				if processedCount%100 == 0 || processedCount == len(files) {
+					r.logger.Printf("Progress: %d/%d files processed (%.1f%%)\n", 
+						processedCount, len(files), float64(processedCount)/float64(len(files))*100)
+				}
+				logMutex.Unlock()
+			}
+		}(i)
 	}
 	
-	r.logger.Printf("Indexing complete. Processed %d files\n", len(files))
+	// Send files to workers
+	for _, file := range files {
+		filesChan <- file
+	}
+	
+	// Close the channel to signal workers to exit
+	close(filesChan)
+	
+	// Wait for all workers to finish
+	wg.Wait()
+	
+	// Log final statistics
+	if errorCount > 0 {
+		r.logger.Printf("Indexing complete with %d errors. Successfully processed %d/%d files\n", 
+			errorCount, len(files)-errorCount, len(files))
+	} else {
+		r.logger.Printf("Indexing complete. Successfully processed all %d files\n", len(files))
+	}
+	
 	return nil
 }
 
@@ -1389,15 +1440,17 @@ func getLanguageFromExt(ext string) string {
 }
 
 // processQuery handles processing a query and displaying results
-func processQuery(rag *Neo4jRAG, query string) {
+func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMResponse bool, limit int, explicitLanguages []string, explicitPathFilters []string, explicitMinScore float64, explicitUseKeywords bool) {
 	fmt.Println("\nQuery:", query)
 	fmt.Println("\nSearching for relevant code...")
 	
-	// Auto-detect language filters from query
-	languages := []string{}
-	queryLower := strings.ToLower(query)
-	
-	languageKeywords := map[string]string{
+	// Auto-detect language filters from query if not explicitly provided
+	languages := explicitLanguages
+	if len(languages) == 0 {
+		languages = []string{}
+		queryLower := strings.ToLower(query)
+		
+		languageKeywords := map[string]string{
 		"golang":      "Go",
 		"go code":     "Go",
 		"python":      "Python",
@@ -1427,11 +1480,15 @@ func processQuery(rag *Neo4jRAG, query string) {
 		if strings.Contains(queryLower, keyword) {
 			languages = append(languages, language)
 		}
+		}
 	}
 	
-	// Extract path filters from query
-	pathFilters := []string{}
-	pathPatterns := []string{
+	// Extract path filters from query if not explicitly provided
+	pathFilters := explicitPathFilters
+	if len(pathFilters) == 0 {
+		pathFilters = []string{}
+		queryLower := strings.ToLower(query)
+		pathPatterns := []string{
 		"in directory", "in dir", "in folder", "in path",
 		"from directory", "from dir", "from folder", "from path",
 	}
@@ -1460,24 +1517,45 @@ func processQuery(rag *Neo4jRAG, query string) {
 				}
 			}
 		}
+		}
 	}
 	
-	// Log the search parameters
-	if len(languages) > 0 {
-		fmt.Printf("Language filters: %v\n", languages)
-	}
-	if len(pathFilters) > 0 {
-		fmt.Printf("Path filters: %v\n", pathFilters)
+	// Use provided parameters or defaults
+	minScore := explicitMinScore
+	useKeywords := explicitUseKeywords
+	
+	// Log the search parameters if not in JSON mode
+	if !jsonOutput {
+		if len(languages) > 0 {
+			fmt.Printf("Language filters: %v\n", languages)
+		}
+		if len(pathFilters) > 0 {
+			fmt.Printf("Path filters: %v\n", pathFilters)
+		}
 	}
 	
 	// Use the advanced search
-	chunks, err := rag.SearchCodeAdvanced(query, 5, languages, pathFilters, 0.1, true)
+	chunks, err := rag.SearchCodeAdvanced(query, limit, languages, pathFilters, minScore, useKeywords)
 	if err != nil {
 		fmt.Printf("Error searching for code: %v\n", err)
 		return
 	}
 	
-	// Display results with more context
+	// Handle JSON output mode
+	if jsonOutput {
+		// Marshal chunks to JSON
+		jsonData, err := json.Marshal(chunks)
+		if err != nil {
+			fmt.Printf("Error marshaling to JSON: %v\n", err)
+			return
+		}
+		
+		// Print JSON output
+		fmt.Println(string(jsonData))
+		return
+	}
+	
+	// Display results with more context in normal mode
 	if len(chunks) == 0 {
 		fmt.Println("No relevant code found")
 	} else {
@@ -1536,6 +1614,11 @@ func processQuery(rag *Neo4jRAG, query string) {
 			// Add a separator between chunks
 			fmt.Println("\n" + strings.Repeat("-", 80))
 		}
+	}
+	
+	// Only generate LLM answer if requested
+	if !generateLLMResponse {
+		return
 	}
 	
 	// Generate answer using LLM
@@ -1666,6 +1749,17 @@ func main() {
 	queryCmd := flag.Bool("query", false, "Query the system")
 	queryString := flag.String("query-string", "", "Query string to search for (used with --query)")
 	
+	// Advanced search options
+	languages := flag.String("languages", "", "Comma-separated list of languages to filter by")
+	pathFilters := flag.String("path-filters", "", "Comma-separated list of path patterns to filter by")
+	minScore := flag.Float64("min-score", 0.1, "Minimum similarity score (0.0-1.0)")
+	useKeywords := flag.Bool("use-keywords", true, "Use keyword matching for better results")
+	limit := flag.Int("limit", 5, "Maximum number of results to return")
+	
+	// Output options
+	jsonOutput := flag.Bool("json-output", false, "Output results in JSON format")
+	llmResponse := flag.Bool("llm-response", false, "Generate LLM response for the query")
+	
 	flag.Parse()
 	
 	// Configure the RAG system
@@ -1708,8 +1802,19 @@ func main() {
 			query := *queryString
 			fmt.Printf("\nQuery: %s\n", query)
 			
+			// Parse advanced search options
+			var langList []string
+			if *languages != "" {
+				langList = strings.Split(*languages, ",")
+			}
+			
+			var pathList []string
+			if *pathFilters != "" {
+				pathList = strings.Split(*pathFilters, ",")
+			}
+			
 			// Process the query
-			processQuery(rag, query)
+			processQuery(rag, query, *jsonOutput, *llmResponse, *limit, langList, pathList, *minScore, *useKeywords)
 		} else {
 			// Start interactive query mode
 			reader := bufio.NewReader(os.Stdin)
@@ -1728,7 +1833,7 @@ func main() {
 				}
 				
 				// Process the query
-				processQuery(rag, query)
+				processQuery(rag, query, *jsonOutput, *llmResponse, *limit, []string{}, []string{}, *minScore, *useKeywords)
 			}
 		}
 	} else {

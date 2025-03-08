@@ -23,7 +23,7 @@ services:
     networks:
       - rag-network
 
-  # Embedding service
+  # Embedding service with enhanced monitoring and stability
   embedding-service:
     build: 
       context: ./embedding
@@ -34,10 +34,26 @@ services:
     volumes:
       - ./embedding:/app
       - embedding-cache:/root/.cache
+      - ./embedding/logs:/app/logs
     environment:
       - MODEL_NAME=all-MiniLM-L6-v2
-    command: python embedding_service.py --model ${MODEL_NAME:-all-MiniLM-L6-v2} --host 0.0.0.0 --port 8080
+      - PYTHONUNBUFFERED=1
+    command: python embedding_service.py --model ${MODEL_NAME:-all-MiniLM-L6-v2} --host 0.0.0.0 --port 8080 --workers 4 --log-level INFO
     restart: unless-stopped
+    # Add resource limits to prevent container from using too much memory
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+    # Add healthcheck to monitor container health
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - rag-network
 

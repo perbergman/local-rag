@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple RAG Search</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css">
+    <style>
+        body {
+            padding: 20px;
+        }
+        .search-container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        pre {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .result-card {
+            margin-bottom: 20px;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .nav-tabs {
+            margin-bottom: 20px;
+        }
+        .tab-content {
+            padding-top: 20px;
+        }
+        .markdown-content {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+        }
+        .markdown-content code {
+            background-color: #f8f9fa;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        .markdown-content pre {
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container search-container">
+        <h1 class="text-center mb-4">Simple RAG Search</h1>
+        
+        <ul class="nav nav-tabs" id="searchTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button" role="tab" aria-controls="search" aria-selected="true">Vector Search</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="llm-tab" data-bs-toggle="tab" data-bs-target="#llm" type="button" role="tab" aria-controls="llm" aria-selected="false">LLM Query</button>
+            </li>
+        </ul>
+        
+        <div class="tab-content" id="searchTabsContent">
+            <!-- Vector Search Tab -->
+            <div class="tab-pane fade show active" id="search" role="tabpanel" aria-labelledby="search-tab">
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <form id="search-form">
+                            <div class="mb-3">
+                                <label for="query" class="form-label">Search Query</label>
+                                <input type="text" class="form-control" id="query" placeholder="Enter your search query...">
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <div class="col-md-6">
+                                    <label for="language" class="form-label">Language Filter</label>
+                                    <select class="form-select" id="language">
+                                        <option value="">All Languages</option>
+                                        <option value="Go">Go</option>
+                                        <option value="Python">Python</option>
+                                        <option value="JavaScript">JavaScript</option>
+                                        <option value="TypeScript">TypeScript</option>
+                                        <option value="Java">Java</option>
+                                        <option value="C#">C#</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="min-score" class="form-label">Min Score: <span id="score-value">0.1</span></label>
+                                    <input type="range" class="form-range" id="min-score" min="0.1" max="0.9" step="0.1" value="0.1">
+                                </div>
+                            </div>
+                            
+                            <div class="d-grid">
+                                <button type="submit" class="btn btn-primary">Search</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- LLM Query Tab -->
+            <div class="tab-pane fade" id="llm" role="tabpanel" aria-labelledby="llm-tab">
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <form id="llm-form">
+                            <div class="mb-3">
+                                <label for="llm-query" class="form-label">Ask a Question</label>
+                                <input type="text" class="form-control" id="llm-query" placeholder="Ask a question about your codebase...">
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <div class="col-md-6">
+                                    <label for="llm-language" class="form-label">Language Filter</label>
+                                    <select class="form-select" id="llm-language">
+                                        <option value="">All Languages</option>
+                                        <option value="Go">Go</option>
+                                        <option value="Python">Python</option>
+                                        <option value="JavaScript">JavaScript</option>
+                                        <option value="TypeScript">TypeScript</option>
+                                        <option value="Java">Java</option>
+                                        <option value="C#">C#</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="llm-min-score" class="form-label">Min Score: <span id="llm-score-value">0.1</span></label>
+                                    <input type="range" class="form-range" id="llm-min-score" min="0.1" max="0.9" step="0.1" value="0.1">
+                                </div>
+                            </div>
+                            
+                            <div class="d-grid">
+                                <button type="submit" class="btn btn-primary">Ask LLM</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            <p>Searching...</p>
+        </div>
+        
+        <div id="results-container"></div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Vector Search Elements
+            const searchForm = document.getElementById('search-form');
+            const queryInput = document.getElementById('query');
+            const languageSelect = document.getElementById('language');
+            const minScoreInput = document.getElementById('min-score');
+            const scoreValue = document.getElementById('score-value');
+            
+            // LLM Query Elements
+            const llmForm = document.getElementById('llm-form');
+            const llmQueryInput = document.getElementById('llm-query');
+            const llmLanguageSelect = document.getElementById('llm-language');
+            const llmMinScoreInput = document.getElementById('llm-min-score');
+            const llmScoreValue = document.getElementById('llm-score-value');
+            
+            // Shared Elements
+            const resultsContainer = document.getElementById('results-container');
+            const loading = document.getElementById('loading');
+            
+            // Configure marked.js
+            marked.setOptions({
+                highlight: function(code, lang) {
+                    if (lang && hljs.getLanguage(lang)) {
+                        return hljs.highlight(code, { language: lang }).value;
+                    }
+                    return hljs.highlightAuto(code).value;
+                },
+                breaks: true
+            });
+            
+            // Add event listener for Enter key in the vector search query input
+            queryInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    performSearch();
+                }
+            });
+            
+            // Add event listener for Enter key in the LLM query input
+            llmQueryInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    performLLMQuery();
+                }
+            });
+            
+            // Update vector search score value display
+            minScoreInput.addEventListener('input', function() {
+                scoreValue.textContent = this.value;
+            });
+            
+            // Update LLM query score value display
+            llmMinScoreInput.addEventListener('input', function() {
+                llmScoreValue.textContent = this.value;
+            });
+            
+            // Function to perform the vector search
+            function performSearch() {
+                const query = queryInput.value.trim();
+                if (!query) {
+                    alert('Please enter a search query');
+                    return;
+                }
+                
+                // Show loading indicator
+                loading.style.display = 'block';
+                resultsContainer.innerHTML = '';
+                
+                // Build URL with query parameters
+                let url = '/api/test-search?query=' + encodeURIComponent(query);
+                
+                // Add language filter if selected
+                const language = languageSelect.value;
+                if (language) {
+                    url += '&language=' + encodeURIComponent(language);
+                }
+                
+                // Add min score
+                url += '&min_score=' + minScoreInput.value;
+                
+                // Make the request
+                fetch(url)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('Search failed: ' + response.status);
+                        }
+                        return response.text();
+                    })
+                    .then(data => {
+                        // Hide loading indicator
+                        loading.style.display = 'none';
+                        
+                        // Display results
+                        resultsContainer.innerHTML = `
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5 class="mb-0">Vector Search Results</h5>
+                                </div>
+                                <div class="card-body">
+                                    <pre><code>${escapeHtml(data)}</code></pre>
+                                </div>
+                            </div>
+                        `;
+                        
+                        // Apply syntax highlighting
+                        document.querySelectorAll('pre code').forEach((block) => {
+                            hljs.highlightElement(block);
+                        });
+                    })
+                    .catch(error => {
+                        // Hide loading indicator
+                        loading.style.display = 'none';
+                        
+                        // Display error
+                        resultsContainer.innerHTML = `
+                            <div class="alert alert-danger">
+                                ${error.message}
+                            </div>
+                        `;
+                        console.error('Error:', error);
+                    });
+            }
+            
+            // Function to perform the LLM query
+            function performLLMQuery() {
+                const query = llmQueryInput.value.trim();
+                if (!query) {
+                    alert('Please enter a question');
+                    return;
+                }
+                
+                // Show loading indicator
+                loading.style.display = 'block';
+                resultsContainer.innerHTML = '';
+                
+                // Build URL with query parameters
+                let url = '/api/llm-query?query=' + encodeURIComponent(query);
+                
+                // Add language filter if selected
+                const language = llmLanguageSelect.value;
+                if (language) {
+                    url += '&language=' + encodeURIComponent(language);
+                }
+                
+                // Add min score
+                url += '&min_score=' + llmMinScoreInput.value;
+                
+                // Make the request
+                fetch(url)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('LLM query failed: ' + response.status);
+                        }
+                        return response.text();
+                    })
+                    .then(data => {
+                        // Hide loading indicator
+                        loading.style.display = 'none';
+                        
+                        // Parse the markdown response
+                        const htmlContent = marked.parse(data);
+                        
+                        // Display results
+                        resultsContainer.innerHTML = `
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5 class="mb-0">LLM Response</h5>
+                                </div>
+                                <div class="card-body">
+                                    <div class="markdown-content">${htmlContent}</div>
+                                </div>
+                            </div>
+                        `;
+                        
+                        // Apply syntax highlighting to code blocks
+                        document.querySelectorAll('pre code').forEach((block) => {
+                            hljs.highlightElement(block);
+                        });
+                    })
+                    .catch(error => {
+                        // Hide loading indicator
+                        loading.style.display = 'none';
+                        
+                        // Display error
+                        resultsContainer.innerHTML = `
+                            <div class="alert alert-danger">
+                                ${error.message}
+                            </div>
+                        `;
+                        console.error('Error:', error);
+                    });
+            }
+            
+            // Handle vector search form submission
+            searchForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                performSearch();
+            });
+            
+            // Handle LLM query form submission
+            llmForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                performLLMQuery();
+            });
+            
+            // Helper function to escape HTML
+            function escapeHtml(unsafe) {
+                return unsafe
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#039;");
+            }
+        });
+    </script>
+</body>
+</html>
