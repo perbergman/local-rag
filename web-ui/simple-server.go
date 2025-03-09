@@ -96,8 +96,8 @@ func (s *SimpleServer) handleTestSearch(w http.ResponseWriter, r *http.Request) 
 		minScore = "0.1"
 	}
 
-	// Build command arguments
-	args := []string{"--query", "--query-string", query}
+	// Build command arguments with properly quoted query string
+	args := []string{"--query", "--query-string", fmt.Sprintf("%q", query)}
 
 	// Add language filter if provided
 	if language != "" {
@@ -108,11 +108,14 @@ func (s *SimpleServer) handleTestSearch(w http.ResponseWriter, r *http.Request) 
 	args = append(args, "--min-score", minScore)
 
 	// Log the command
-	s.logger.Printf("Executing command: %s %s", s.mainBinary, strings.Join(args, " "))
+	s.logger.Printf("Executing command: go run %s %s", filepath.Base(s.mainBinary), strings.Join(args, " "))
 
-	// Create command
-	cmd := exec.Command(s.mainBinary, args...)
-	cmd.Dir = filepath.Dir(s.mainBinary)
+	// Create command - use 'go run' instead of direct execution
+	mainDir := filepath.Dir(s.mainBinary)
+	mainFile := filepath.Base(s.mainBinary)
+	allArgs := append([]string{"run", mainFile}, args...)
+	cmd := exec.Command("go", allArgs...)
+	cmd.Dir = mainDir
 	cmd.Env = os.Environ()
 
 	// Execute command
@@ -154,11 +157,11 @@ func (s *SimpleServer) handleLLMQuery(w http.ResponseWriter, r *http.Request) {
 		minScore = "0.1"
 	}
 
-	// Set a longer timeout for LLM queries
-	timeoutDuration := 60 * time.Second
+	// Set a longer timeout for LLM queries to accommodate LMStudio's single-threaded processing
+	timeoutDuration := 3 * time.Minute
 	
-	// Build command arguments
-	args := []string{"--query", "--llm-response", "--query-string", query}
+	// Build command arguments with properly quoted query string
+	args := []string{"--query", "--llm-response", "--query-string", fmt.Sprintf("%q", query)}
 
 	// Add language filter if provided
 	if language != "" {
@@ -171,7 +174,7 @@ func (s *SimpleServer) handleLLMQuery(w http.ResponseWriter, r *http.Request) {
 	// Log the command
 	s.logger.Printf("Executing LLM query command: %s %s", s.mainBinary, strings.Join(args, " "))
 
-	// Create command with timeout
+	// Create command with timeout - execute the binary directly
 	cmd := exec.Command(s.mainBinary, args...)
 	cmd.Dir = filepath.Dir(s.mainBinary)
 	cmd.Env = os.Environ()
