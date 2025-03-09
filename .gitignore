@@ -59,3 +59,4 @@ neo4j/plugins/
 
 # Test larger codebase
 /test-larger-codebase
+/neo4j-rag

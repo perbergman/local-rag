@@ -14,10 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
@@ -160,7 +158,8 @@ func (r *Neo4jRAG) initDatabase() error {
 	return nil
 }
 
-// IndexDirectory indexes a directory of code using parallel processing
+// IndexDirectory indexes a directory of code using sequential processing
+// optimized for LMStudio which doesn't handle multiple concurrent requests well
 func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	r.logger.Printf("Indexing directory: %s\n", dir)
 	
@@ -171,60 +170,29 @@ func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	}
 	
 	r.logger.Printf("Found %d files to index\n", len(files))
+	r.logger.Printf("Using single-threaded processing optimized for LMStudio\n")
 	
-	// Use parallel processing with worker pool for large codebases
-	workerCount := runtime.NumCPU() // Use number of available CPUs
-	r.logger.Printf("Using %d parallel workers for indexing\n", workerCount)
-	
-	// Create a channel for files to process
-	filesChan := make(chan string, len(files))
-	
-	// Create a wait group to wait for all workers to finish
-	var wg sync.WaitGroup
-	
-	// Create a mutex for thread-safe logging and counting
-	var logMutex sync.Mutex
+	// Process files sequentially
 	processedCount := 0
 	errorCount := 0
 	
-	// Start worker goroutines
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func(workerId int) {
-			defer wg.Done()
-			
-			for file := range filesChan {
-				// Process the file
-				err := r.processFile(file, dir)
-				
-				// Update counters with mutex protection
-				logMutex.Lock()
-				processedCount++
-				if err != nil {
-					errorCount++
-					r.logger.Printf("Worker %d: Error processing file %s: %v\n", workerId, file, err)
-				}
-				
-				// Log progress periodically
-				if processedCount%100 == 0 || processedCount == len(files) {
-					r.logger.Printf("Progress: %d/%d files processed (%.1f%%)\n", 
-						processedCount, len(files), float64(processedCount)/float64(len(files))*100)
-				}
-				logMutex.Unlock()
-			}
-		}(i)
-	}
-	
-	// Send files to workers
 	for _, file := range files {
-		filesChan <- file
+		// Process the file
+		err := r.processFile(file, dir)
+		
+		// Update counters
+		processedCount++
+		if err != nil {
+			errorCount++
+			r.logger.Printf("Error processing file %s: %v\n", file, err)
+		}
+		
+		// Log progress periodically
+		if processedCount%10 == 0 || processedCount == len(files) {
+			r.logger.Printf("Progress: %d/%d files processed (%.1f%%)\n", 
+				processedCount, len(files), float64(processedCount)/float64(len(files))*100)
+		}
 	}
-	
-	// Close the channel to signal workers to exit
-	close(filesChan)
-	
-	// Wait for all workers to finish
-	wg.Wait()
 	
 	// Log final statistics
 	if errorCount > 0 {
@@ -815,32 +783,54 @@ func (r *Neo4jRAG) chunkBySize(content, filePath, projectPath, language string) 
 }
 
 // generateEmbeddings generates embeddings for chunks
+// optimized for LMStudio by processing in smaller batches
 func (r *Neo4jRAG) generateEmbeddings(chunks []CodeChunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}
 	
-	// Prepare texts for embedding
-	texts := make([]string, len(chunks))
-	for i, chunk := range chunks {
-		texts[i] = chunk.Content
-	}
+	// Process in smaller batches to avoid overwhelming LMStudio
+	batchSize := 5 // Small batch size to avoid overwhelming LMStudio
 	
-	// Call embedding service
-	embeddings, err := r.getEmbeddings(texts)
-	if err != nil {
-		return fmt.Errorf("failed to generate embeddings: %w", err)
-	}
-	
-	// Assign embeddings to chunks
-	for i, embedding := range embeddings {
-		chunks[i].Embedding = embedding
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		
+		batch := chunks[i:end]
+		
+		// Prepare texts for embedding
+		texts := make([]string, len(batch))
+		for j, chunk := range batch {
+			texts[j] = chunk.Content
+		}
+		
+		// Call embedding service
+		r.logger.Printf("Generating embeddings for batch %d/%d (size: %d)", 
+			(i/batchSize)+1, (len(chunks)+batchSize-1)/batchSize, len(batch))
+		
+		embeddings, err := r.getEmbeddings(texts)
+		if err != nil {
+			return fmt.Errorf("failed to generate embeddings for batch %d: %w", (i/batchSize)+1, err)
+		}
+		
+		// Assign embeddings to chunks
+		for j, embedding := range embeddings {
+			batch[j].Embedding = embedding
+		}
+		
+		// Add a small delay between batches to avoid overwhelming LMStudio
+		if i+batchSize < len(chunks) {
+			time.Sleep(1 * time.Second)
+		}
 	}
 	
 	return nil
 }
 
-// getEmbeddings calls the embedding service
+// getEmbeddings calls the embedding service with retry logic
+// optimized for LMStudio which may be slow with requests
 func (r *Neo4jRAG) getEmbeddings(texts []string) ([][]float32, error) {
 	// Prepare request
 	req := EmbeddingRequest{
@@ -852,10 +842,36 @@ func (r *Neo4jRAG) getEmbeddings(texts []string) ([][]float32, error) {
 		return nil, err
 	}
 	
-	// Call embedding service
-	resp, err := http.Post(r.config.EmbeddingURL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, err
+	// Add retry logic with backoff
+	maxRetries := 3
+	backoffDuration := 1 * time.Second
+	
+	var resp *http.Response
+	var lastErr error
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			r.logger.Printf("Retrying embedding request (attempt %d/%d) after %v delay", 
+				attempt+1, maxRetries, backoffDuration)
+			time.Sleep(backoffDuration)
+			backoffDuration *= 2 // Exponential backoff
+		}
+		
+		// Call embedding service
+		resp, err = http.Post(r.config.EmbeddingURL, "application/json", bytes.NewBuffer(reqBody))
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break // Success
+		}
+		
+		lastErr = err
+		if err == nil {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("embedding service returned status code %d", resp.StatusCode)
+		}
+	}
+	
+	if resp == nil || lastErr != nil {
+		return nil, fmt.Errorf("failed to get embeddings after %d attempts: %w", maxRetries, lastErr)
 	}
 	defer resp.Body.Close()
 	
@@ -865,6 +881,9 @@ func (r *Neo4jRAG) getEmbeddings(texts []string) ([][]float32, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// Add a small delay after successful embedding to avoid overwhelming LMStudio
+	time.Sleep(500 * time.Millisecond)
 	
 	return embeddingResp.Embeddings, nil
 }
