@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -37,32 +38,32 @@ type Config struct {
 
 // CodeChunk represents a chunk of code with metadata
 type CodeChunk struct {
-	ID          string   `json:"id"`
-	Content     string   `json:"content"`
-	FilePath    string   `json:"file_path"`
-	ProjectPath string   `json:"project_path"`
-	Language    string   `json:"language"`
-	StartLine   int      `json:"start_line"`
-	EndLine     int      `json:"end_line"`
-	EntityType  string   `json:"entity_type"` // "function", "class", "method", "chunk"
-	Name        string   `json:"name"`        // function/class name if available
-	Signature   string   `json:"signature"`   // function signature if available
-	Embedding   []float32 `json:"-"`         // Vector embedding (not stored in JSON)
-	Hash        string   `json:"hash"`        // Content hash for change detection
-	Score       float64  `json:"score"`       // Similarity score from search
+	ID          string    `json:"id"`
+	Content     string    `json:"content"`
+	FilePath    string    `json:"file_path"`
+	ProjectPath string    `json:"project_path"`
+	Language    string    `json:"language"`
+	StartLine   int       `json:"start_line"`
+	EndLine     int       `json:"end_line"`
+	EntityType  string    `json:"entity_type"` // "function", "class", "method", "chunk"
+	Name        string    `json:"name"`        // function/class name if available
+	Signature   string    `json:"signature"`   // function signature if available
+	Embedding   []float32 `json:"-"`           // Vector embedding (not stored in JSON)
+	Hash        string    `json:"hash"`        // Content hash for change detection
+	Score       float64   `json:"score"`       // Similarity score from search
 }
 
 // LLMRequest represents a request to the LLM
 type LLMRequest struct {
-	Prompt    string  `json:"prompt"`
-	MaxTokens int     `json:"max_tokens"`
+	Prompt      string  `json:"prompt"`
+	MaxTokens   int     `json:"max_tokens"`
 	Temperature float32 `json:"temperature"`
 }
 
 // LLMResponse represents a response from the LLM
 type LLMResponse struct {
-	Text     string `json:"text"`
-	TokensUsed int  `json:"tokens_used"`
+	Text       string `json:"text"`
+	TokensUsed int    `json:"tokens_used"`
 }
 
 // EmbeddingRequest represents a request to the embedding service
@@ -80,40 +81,46 @@ type Neo4jRAG struct {
 	driver neo4j.Driver
 	config Config
 	logger *log.Logger
+
+	// Logging counters for reduced verbosity
+	healthCheckCounter             int
+	consecutiveHealthCheckFailures int
+	llmQueryCounter                int
+	consecutiveLLMFailures         int
 }
 
 // NewNeo4jRAG creates a new Neo4jRAG instance
 func NewNeo4jRAG(config Config) (*Neo4jRAG, error) {
 	logger := log.New(os.Stdout, "NEO4J-RAG: ", log.LstdFlags)
-	
+
 	// Connect to Neo4j
 	logger.Println("Connecting to Neo4j at", config.Neo4jURI)
 	driver, err := neo4j.NewDriver(config.Neo4jURI, neo4j.BasicAuth(config.Neo4jUser, config.Neo4jPassword, ""))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Neo4j: %w", err)
 	}
-	
+
 	// Test the connection
 	err = driver.VerifyConnectivity()
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify Neo4j connectivity: %w", err)
 	}
-	
+
 	logger.Println("Successfully connected to Neo4j")
-	
+
 	rag := &Neo4jRAG{
 		driver: driver,
 		config: config,
 		logger: logger,
 	}
-	
+
 	// Initialize database
 	err = rag.initDatabase()
 	if err != nil {
 		driver.Close()
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
-	
+
 	return rag, nil
 }
 
@@ -126,7 +133,7 @@ func (r *Neo4jRAG) Close() {
 func (r *Neo4jRAG) initDatabase() error {
 	session := r.driver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
-	
+
 	// Create constraints and indexes
 	constraints := []string{
 		"CREATE CONSTRAINT chunk_id IF NOT EXISTS ON (c:Chunk) ASSERT c.id IS UNIQUE",
@@ -136,14 +143,14 @@ func (r *Neo4jRAG) initDatabase() error {
 		"CREATE INDEX chunk_language IF NOT EXISTS FOR (c:Chunk) ON (c.language)",
 		"CREATE INDEX chunk_entity_type IF NOT EXISTS FOR (c:Chunk) ON (c.entity_type)",
 	}
-	
+
 	for _, constraint := range constraints {
 		_, err := session.Run(constraint, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create constraint: %w", err)
 		}
 	}
-	
+
 	// Check if GDS library is available
 	gdsResult, gdsErr := session.Run("CALL gds.list() YIELD name RETURN count(name) as count", nil)
 	if gdsErr != nil {
@@ -154,7 +161,7 @@ func (r *Neo4jRAG) initDatabase() error {
 			r.logger.Printf("GDS library initialized with %v procedures\n", count)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -162,208 +169,208 @@ func (r *Neo4jRAG) initDatabase() error {
 // optimized for LMStudio which doesn't handle multiple concurrent requests well
 func (r *Neo4jRAG) IndexDirectory(dir string) error {
 	r.logger.Printf("Indexing directory: %s\n", dir)
-	
+
 	// Get all code files recursively
 	files, err := r.findCodeFiles(dir)
 	if err != nil {
 		return fmt.Errorf("failed to find code files: %w", err)
 	}
-	
+
 	r.logger.Printf("Found %d files to index\n", len(files))
 	r.logger.Printf("Using single-threaded processing optimized for LMStudio\n")
-	
+
 	// Process files sequentially
 	processedCount := 0
 	errorCount := 0
-	
+
 	for _, file := range files {
 		// Process the file
 		err := r.processFile(file, dir)
-		
+
 		// Update counters
 		processedCount++
 		if err != nil {
 			errorCount++
 			r.logger.Printf("Error processing file %s: %v\n", file, err)
 		}
-		
+
 		// Log progress periodically
 		if processedCount%10 == 0 || processedCount == len(files) {
-			r.logger.Printf("Progress: %d/%d files processed (%.1f%%)\n", 
+			r.logger.Printf("Progress: %d/%d files processed (%.1f%%)\n",
 				processedCount, len(files), float64(processedCount)/float64(len(files))*100)
 		}
 	}
-	
+
 	// Log final statistics
 	if errorCount > 0 {
-		r.logger.Printf("Indexing complete with %d errors. Successfully processed %d/%d files\n", 
+		r.logger.Printf("Indexing complete with %d errors. Successfully processed %d/%d files\n",
 			errorCount, len(files)-errorCount, len(files))
 	} else {
 		r.logger.Printf("Indexing complete. Successfully processed all %d files\n", len(files))
 	}
-	
+
 	return nil
 }
 
 // findCodeFiles recursively finds all code files in a directory with comprehensive filtering
 func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 	var files []string
-	
+
 	// Extensions to include - expanded list of code file extensions
 	extensions := map[string]bool{
 		// Programming languages
-		".go":    true,
-		".py":    true,
-		".js":    true,
-		".jsx":   true,
-		".ts":    true,
-		".tsx":   true,
-		".java":  true,
-		".c":     true,
-		".cpp":   true,
-		".cc":    true,
-		".cxx":   true,
-		".h":     true,
-		".hpp":   true,
-		".hxx":   true,
-		".cs":    true,
-		".php":   true,
-		".rb":    true,
-		".rs":    true,
-		".swift": true,
-		".kt":    true,
-		".scala": true,
-		".pl":    true,
-		".pm":    true,
-		".r":     true,
-		".lua":   true,
-		".groovy":true,
-		".dart":  true,
-		".elm":   true,
-		".ex":    true,
-		".exs":   true,
-		".erl":   true,
-		".hrl":   true,
-		".clj":   true,
-		".hs":    true,
-		".fs":    true,
-		".fsx":   true,
-		".ml":    true,
-		".mli":   true,
-		
+		".go":     true,
+		".py":     true,
+		".js":     true,
+		".jsx":    true,
+		".ts":     true,
+		".tsx":    true,
+		".java":   true,
+		".c":      true,
+		".cpp":    true,
+		".cc":     true,
+		".cxx":    true,
+		".h":      true,
+		".hpp":    true,
+		".hxx":    true,
+		".cs":     true,
+		".php":    true,
+		".rb":     true,
+		".rs":     true,
+		".swift":  true,
+		".kt":     true,
+		".scala":  true,
+		".pl":     true,
+		".pm":     true,
+		".r":      true,
+		".lua":    true,
+		".groovy": true,
+		".dart":   true,
+		".elm":    true,
+		".ex":     true,
+		".exs":    true,
+		".erl":    true,
+		".hrl":    true,
+		".clj":    true,
+		".hs":     true,
+		".fs":     true,
+		".fsx":    true,
+		".ml":     true,
+		".mli":    true,
+
 		// Shell scripts
-		".sh":    true,
-		".bash":  true,
-		".zsh":   true,
-		".fish":  true,
-		".ps1":   true,
-		".bat":   true,
-		".cmd":   true,
-		
+		".sh":   true,
+		".bash": true,
+		".zsh":  true,
+		".fish": true,
+		".ps1":  true,
+		".bat":  true,
+		".cmd":  true,
+
 		// Web development
-		".html":  true,
-		".htm":   true,
-		".xhtml": true,
-		".css":   true,
-		".scss":  true,
-		".sass":  true,
-		".less":  true,
-		".vue":   true,
-		".svelte":true,
-		
+		".html":   true,
+		".htm":    true,
+		".xhtml":  true,
+		".css":    true,
+		".scss":   true,
+		".sass":   true,
+		".less":   true,
+		".vue":    true,
+		".svelte": true,
+
 		// Data and config files
-		".json":  true,
-		".yaml":  true,
-		".yml":   true,
-		".xml":   true,
-		".toml":  true,
-		".ini":   true,
-		".sql":   true,
-		".graphql":true,
-		".proto": true,
-		
+		".json":    true,
+		".yaml":    true,
+		".yml":     true,
+		".xml":     true,
+		".toml":    true,
+		".ini":     true,
+		".sql":     true,
+		".graphql": true,
+		".proto":   true,
+
 		// Documentation
-		".md":    true,
-		".rst":   true,
-		".tex":   true,
-		".adoc":  true,
+		".md":   true,
+		".rst":  true,
+		".tex":  true,
+		".adoc": true,
 	}
-	
+
 	// Directories to ignore - expanded with more common patterns
 	ignoreDirs := map[string]bool{
 		// Package managers and dependencies
-		"node_modules":    true,
-		"vendor":          true,
-		"bower_components":true,
-		"jspm_packages":   true,
-		"packages":        true,
-		
+		"node_modules":     true,
+		"vendor":           true,
+		"bower_components": true,
+		"jspm_packages":    true,
+		"packages":         true,
+
 		// Version control
-		".git":            true,
-		".svn":            true,
-		".hg":             true,
-		".bzr":            true,
-		
+		".git": true,
+		".svn": true,
+		".hg":  true,
+		".bzr": true,
+
 		// Virtual environments
-		".venv":           true,
-		"venv":            true,
-		"env":             true,
-		".env":            true,
-		"virtualenv":      true,
-		"__pycache__":     true,
-		"site-packages":   true,
-		
+		".venv":         true,
+		"venv":          true,
+		"env":           true,
+		".env":          true,
+		"virtualenv":    true,
+		"__pycache__":   true,
+		"site-packages": true,
+
 		// Build and distribution
-		"dist":            true,
-		"build":           true,
-		"out":             true,
-		"bin":             true,
-		"target":          true,
-		"output":          true,
-		"release":         true,
-		"debug":           true,
-		
+		"dist":    true,
+		"build":   true,
+		"out":     true,
+		"bin":     true,
+		"target":  true,
+		"output":  true,
+		"release": true,
+		"debug":   true,
+
 		// IDE and editor
-		".idea":           true,
-		".vscode":         true,
-		".vs":             true,
-		".eclipse":        true,
-		".settings":       true,
-		
+		".idea":     true,
+		".vscode":   true,
+		".vs":       true,
+		".eclipse":  true,
+		".settings": true,
+
 		// Temporary and cache
-		"tmp":             true,
-		"temp":            true,
-		"cache":           true,
-		".cache":          true,
-		".sass-cache":     true,
-		
+		"tmp":         true,
+		"temp":        true,
+		"cache":       true,
+		".cache":      true,
+		".sass-cache": true,
+
 		// Documentation
-		"docs":            true,
-		"doc":             true,
-		
+		"docs": true,
+		"doc":  true,
+
 		// Test coverage
-		"coverage":        true,
-		".nyc_output":     true,
-		".coverage":       true,
-		"htmlcov":         true,
-		
+		"coverage":    true,
+		".nyc_output": true,
+		".coverage":   true,
+		"htmlcov":     true,
+
 		// Logs
-		"logs":            true,
-		"log":             true,
+		"logs": true,
+		"log":  true,
 	}
-	
+
 	// Files to ignore (by pattern)
 	ignoreFilePatterns := []string{
 		// Minified files
 		"*.min.js",
 		"*.min.css",
-		
+
 		// Generated files
 		"*.generated.*",
 		"*_generated.*",
 		"*.g.*",
 		"*.pb.*",
-		
+
 		// Compiled binaries
 		"*.exe",
 		"*.dll",
@@ -376,7 +383,7 @@ func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 		"*.lib",
 		"*.pyc",
 		"*.pyo",
-		
+
 		// Archives
 		"*.zip",
 		"*.tar",
@@ -385,7 +392,7 @@ func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 		"*.xz",
 		"*.rar",
 		"*.7z",
-		
+
 		// Media files
 		"*.jpg", "*.jpeg",
 		"*.png",
@@ -400,63 +407,63 @@ func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 		"*.avi",
 		"*.mov",
 		"*.webm",
-		
+
 		// Lock files
 		"*.lock",
 		"package-lock.json",
 		"yarn.lock",
 		"Cargo.lock",
-		
+
 		// Backup files
 		"*~",
 		"*.bak",
 		"*.swp",
 		"*.swo",
-		
+
 		// Large data files
 		"*.csv",
 		"*.tsv",
 		"*.db",
 		"*.sqlite",
 		"*.sqlite3",
-		
+
 		// Logs
 		"*.log",
 	}
-	
+
 	// Maximum file size to process (1MB)
 	maxFileSize := int64(1 * 1024 * 1024)
-	
+
 	r.logger.Printf("Starting file indexing with enhanced filtering from root: %s\n", root)
-	
+
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			r.logger.Printf("Error accessing path %s: %v\n", path, err)
 			return nil // Continue walking despite the error
 		}
-		
+
 		// Skip if file is too large
 		if !info.IsDir() && info.Size() > maxFileSize {
 			r.logger.Printf("Skipping large file: %s (%.2f MB)\n", path, float64(info.Size())/(1024*1024))
 			return nil
 		}
-		
+
 		// Handle directories
 		if info.IsDir() {
 			// Check if we should skip this directory
 			baseName := filepath.Base(path)
-			
+
 			// Skip hidden directories (starting with .)
 			if strings.HasPrefix(baseName, ".") && baseName != "." && baseName != ".." {
 				return filepath.SkipDir
 			}
-			
+
 			// Check for direct matches with excluded directories
 			if ignoreDirs[baseName] {
 				r.logger.Printf("Skipping directory: %s\n", path)
 				return filepath.SkipDir
 			}
-			
+
 			// Check for path components that should be skipped
 			pathParts := strings.Split(path, string(os.PathSeparator))
 			for _, part := range pathParts {
@@ -465,25 +472,25 @@ func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 					return filepath.SkipDir
 				}
 			}
-			
+
 			// Check for virtual environment paths
 			if (strings.Contains(path, "venv/lib/python") && strings.Contains(path, "site-packages")) ||
-			   (strings.Contains(path, "env/lib/python") && strings.Contains(path, "site-packages")) {
+				(strings.Contains(path, "env/lib/python") && strings.Contains(path, "site-packages")) {
 				r.logger.Printf("Skipping Python virtual environment path: %s\n", path)
 				return filepath.SkipDir
 			}
-			
+
 			return nil
 		}
-		
+
 		// Handle files
 		fileName := filepath.Base(path)
-		
+
 		// Skip hidden files
 		if strings.HasPrefix(fileName, ".") {
 			return nil
 		}
-		
+
 		// Skip files matching ignore patterns
 		for _, pattern := range ignoreFilePatterns {
 			matched, err := filepath.Match(pattern, fileName)
@@ -495,17 +502,17 @@ func (r *Neo4jRAG) findCodeFiles(root string) ([]string, error) {
 				return nil
 			}
 		}
-		
+
 		// Check if file extension is one we want to process
 		ext := strings.ToLower(filepath.Ext(path))
 		if extensions[ext] {
 			r.logger.Printf("Including file: %s\n", path)
 			files = append(files, path)
 		}
-		
+
 		return nil
 	})
-	
+
 	r.logger.Printf("File filtering complete. Found %d files to process\n", len(files))
 	return files, err
 }
@@ -517,96 +524,96 @@ func (r *Neo4jRAG) processFile(filePath, rootDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
-	
+
 	// Skip if file is too large (>1MB)
 	if len(content) > 1024*1024 {
 		r.logger.Printf("Skipping large file: %s (%d bytes)\n", filePath, len(content))
 		return nil
 	}
-	
+
 	// Get file info
 	relPath, err := filepath.Rel(rootDir, filePath)
 	if err != nil {
 		relPath = filePath
 	}
-	
+
 	ext := strings.ToLower(filepath.Ext(filePath))
 	language := getLanguageFromExt(ext)
-	
+
 	// Determine project path (typically the first directory in the relative path)
 	projectPath := rootDir
 	pathParts := strings.Split(relPath, string(filepath.Separator))
 	if len(pathParts) > 1 {
 		projectPath = filepath.Join(rootDir, pathParts[0])
 	}
-	
+
 	// Chunk the file
 	chunks, err := r.chunkFile(string(content), filePath, projectPath, language)
 	if err != nil {
 		return fmt.Errorf("failed to chunk file: %w", err)
 	}
-	
+
 	// Skip if no chunks were created
 	if len(chunks) == 0 {
 		return nil
 	}
-	
+
 	// Generate embeddings for chunks
 	err = r.generateEmbeddings(chunks)
 	if err != nil {
 		return fmt.Errorf("failed to generate embeddings: %w", err)
 	}
-	
+
 	// Store chunks in Neo4j
 	err = r.storeChunks(chunks, filePath, projectPath)
 	if err != nil {
 		return fmt.Errorf("failed to store chunks: %w", err)
 	}
-	
+
 	return nil
 }
 
 // chunkFile splits a file into chunks
 func (r *Neo4jRAG) chunkFile(content, filePath, projectPath, language string) ([]CodeChunk, error) {
 	var chunks []CodeChunk
-	
+
 	// For Go files, try to split by functions/methods
 	if language == "Go" {
 		chunks = r.chunkGoCode(content, filePath, projectPath)
 	}
-	
+
 	// For other languages or if function chunking produced too few chunks
 	if len(chunks) < 2 {
 		chunks = r.chunkBySize(content, filePath, projectPath, language)
 	}
-	
+
 	// Generate IDs and hashes for chunks
 	for i := range chunks {
 		// Generate a deterministic ID based on file path and chunk position
 		idStr := fmt.Sprintf("%s:%d:%d", filePath, chunks[i].StartLine, chunks[i].EndLine)
 		h := md5.Sum([]byte(idStr))
 		chunks[i].ID = hex.EncodeToString(h[:])
-		
+
 		// Generate content hash for change detection
 		contentHash := md5.Sum([]byte(chunks[i].Content))
 		chunks[i].Hash = hex.EncodeToString(contentHash[:])
 	}
-	
+
 	return chunks, nil
 }
 
 // chunkGoCode splits Go code by functions and methods
 func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChunk {
 	chunks := []CodeChunk{}
-	
+
 	// Regex patterns for Go functions
 	funcPattern := regexp.MustCompile(`func\s+(\w+)\s*\((.*?)\)(?:\s+\w+)?\s*{`)
 	methodPattern := regexp.MustCompile(`func\s+\(\w+\s+\*?\w+\)\s+(\w+)\s*\((.*?)\)(?:\s+\w+)?\s*{`)
-	
+
 	// Find all functions
 	funcMatches := funcPattern.FindAllStringSubmatchIndex(content, -1)
 	methodMatches := methodPattern.FindAllStringSubmatchIndex(content, -1)
-	
+
 	// Combine and sort all matches by their start position
 	type match struct {
 		start    int
@@ -615,9 +622,9 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 		sig      string
 		isMethod bool
 	}
-	
+
 	allMatches := []match{}
-	
+
 	// Process function matches
 	for _, m := range funcMatches {
 		if len(m) >= 4 {
@@ -635,7 +642,7 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 			})
 		}
 	}
-	
+
 	// Process method matches
 	for _, m := range methodMatches {
 		if len(m) >= 4 {
@@ -653,12 +660,12 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 			})
 		}
 	}
-	
+
 	// Sort by start position
 	sort.Slice(allMatches, func(i, j int) bool {
 		return allMatches[i].start < allMatches[j].start
 	})
-	
+
 	// Create chunks from matches
 	lines := strings.Split(content, "\n")
 	linePositions := make([]int, len(lines)+1)
@@ -668,18 +675,18 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 		pos += len(line) + 1 // +1 for newline
 	}
 	linePositions[len(lines)] = pos
-	
+
 	for i, m := range allMatches {
 		startPos := m.start
 		var endPos int
-		
+
 		// End position is either the start of next function or end of file
 		if i < len(allMatches)-1 {
 			endPos = allMatches[i+1].start
 		} else {
 			endPos = len(content)
 		}
-		
+
 		// Find start and end lines
 		startLine := sort.Search(len(linePositions), func(i int) bool {
 			return linePositions[i] > startPos
@@ -687,20 +694,20 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 		if startLine < 0 {
 			startLine = 0
 		}
-		
+
 		endLine := sort.Search(len(linePositions), func(i int) bool {
 			return linePositions[i] > endPos
 		}) - 1
 		if endLine < 0 {
 			endLine = 0
 		}
-		
+
 		// Create chunk
 		entityType := "function"
 		if m.isMethod {
 			entityType = "method"
 		}
-		
+
 		chunks = append(chunks, CodeChunk{
 			FilePath:    filePath,
 			ProjectPath: projectPath,
@@ -713,7 +720,7 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 			Language:    "Go",
 		})
 	}
-	
+
 	return chunks
 }
 
@@ -721,7 +728,7 @@ func (r *Neo4jRAG) chunkGoCode(content, filePath, projectPath string) []CodeChun
 func (r *Neo4jRAG) chunkBySize(content, filePath, projectPath, language string) []CodeChunk {
 	chunks := []CodeChunk{}
 	lines := strings.Split(content, "\n")
-	
+
 	// If file is small enough, return as single chunk
 	if len(content) <= r.config.MaxChunkSize {
 		return []CodeChunk{
@@ -737,22 +744,22 @@ func (r *Neo4jRAG) chunkBySize(content, filePath, projectPath, language string) 
 			},
 		}
 	}
-	
+
 	// Otherwise, split into multiple chunks
 	currentChunk := []string{}
 	currentSize := 0
 	startLine := 1
-	
+
 	for i, line := range lines {
 		lineLen := len(line) + 1 // +1 for newline
 		currentChunk = append(currentChunk, line)
 		currentSize += lineLen
-		
+
 		// If chunk is big enough or we're at the end, save it
 		if currentSize >= r.config.MaxChunkSize || i == len(lines)-1 {
 			chunkContent := strings.Join(currentChunk, "\n")
 			endLine := startLine + len(currentChunk) - 1
-			
+
 			chunks = append(chunks, CodeChunk{
 				FilePath:    filePath,
 				ProjectPath: projectPath,
@@ -763,13 +770,13 @@ func (r *Neo4jRAG) chunkBySize(content, filePath, projectPath, language string) 
 				Name:        fmt.Sprintf("chunk_%d_%d", startLine, endLine),
 				Language:    language,
 			})
-			
+
 			// Start new chunk with overlap
 			overlapLines := r.config.ChunkOverlap
 			if overlapLines > len(currentChunk) {
 				overlapLines = len(currentChunk)
 			}
-			
+
 			currentChunk = currentChunk[len(currentChunk)-overlapLines:]
 			startLine = endLine - overlapLines + 1
 			currentSize = 0
@@ -778,7 +785,7 @@ func (r *Neo4jRAG) chunkBySize(content, filePath, projectPath, language string) 
 			}
 		}
 	}
-	
+
 	return chunks
 }
 
@@ -788,44 +795,44 @@ func (r *Neo4jRAG) generateEmbeddings(chunks []CodeChunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}
-	
+
 	// Process in smaller batches to avoid overwhelming LMStudio
 	batchSize := 5 // Small batch size to avoid overwhelming LMStudio
-	
+
 	for i := 0; i < len(chunks); i += batchSize {
 		end := i + batchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
-		
+
 		batch := chunks[i:end]
-		
+
 		// Prepare texts for embedding
 		texts := make([]string, len(batch))
 		for j, chunk := range batch {
 			texts[j] = chunk.Content
 		}
-		
+
 		// Call embedding service
-		r.logger.Printf("Generating embeddings for batch %d/%d (size: %d)", 
+		r.logger.Printf("Generating embeddings for batch %d/%d (size: %d)",
 			(i/batchSize)+1, (len(chunks)+batchSize-1)/batchSize, len(batch))
-		
+
 		embeddings, err := r.getEmbeddings(texts)
 		if err != nil {
 			return fmt.Errorf("failed to generate embeddings for batch %d: %w", (i/batchSize)+1, err)
 		}
-		
+
 		// Assign embeddings to chunks
 		for j, embedding := range embeddings {
 			batch[j].Embedding = embedding
 		}
-		
+
 		// Add a small delay between batches to avoid overwhelming LMStudio
 		if i+batchSize < len(chunks) {
 			time.Sleep(1 * time.Second)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -836,55 +843,55 @@ func (r *Neo4jRAG) getEmbeddings(texts []string) ([][]float32, error) {
 	req := EmbeddingRequest{
 		Texts: texts,
 	}
-	
+
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Add retry logic with backoff
 	maxRetries := 3
 	backoffDuration := 1 * time.Second
-	
+
 	var resp *http.Response
 	var lastErr error
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			r.logger.Printf("Retrying embedding request (attempt %d/%d) after %v delay", 
+			r.logger.Printf("Retrying embedding request (attempt %d/%d) after %v delay",
 				attempt+1, maxRetries, backoffDuration)
 			time.Sleep(backoffDuration)
 			backoffDuration *= 2 // Exponential backoff
 		}
-		
+
 		// Call embedding service
 		resp, err = http.Post(r.config.EmbeddingURL, "application/json", bytes.NewBuffer(reqBody))
 		if err == nil && resp.StatusCode == http.StatusOK {
 			break // Success
 		}
-		
+
 		lastErr = err
 		if err == nil {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("embedding service returned status code %d", resp.StatusCode)
 		}
 	}
-	
+
 	if resp == nil || lastErr != nil {
 		return nil, fmt.Errorf("failed to get embeddings after %d attempts: %w", maxRetries, lastErr)
 	}
 	defer resp.Body.Close()
-	
+
 	// Parse response
 	var embeddingResp EmbeddingResponse
 	err = json.NewDecoder(resp.Body).Decode(&embeddingResp)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Add a small delay after successful embedding to avoid overwhelming LMStudio
 	time.Sleep(500 * time.Millisecond)
-	
+
 	return embeddingResp.Embeddings, nil
 }
 
@@ -892,7 +899,7 @@ func (r *Neo4jRAG) getEmbeddings(texts []string) ([][]float32, error) {
 func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string) error {
 	session := r.driver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
-	
+
 	// Create a transaction
 	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
 		// Create/merge project node
@@ -909,7 +916,7 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// Create/merge file node
 		_, err = tx.Run(
 			`MERGE (f:File {path: $filePath}) 
@@ -930,7 +937,7 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// Store each chunk
 		for _, chunk := range chunks {
 			// Check if chunk exists with same hash (unchanged)
@@ -941,7 +948,7 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 			if err != nil {
 				return nil, err
 			}
-			
+
 			record, err := result.Single()
 			if err == nil { // Chunk exists
 				storedHash, _ := record.Get("c.hash")
@@ -950,7 +957,7 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 					continue
 				}
 			}
-			
+
 			// Create/update chunk node with embedding
 			params := map[string]interface{}{
 				"id":          chunk.ID,
@@ -967,7 +974,7 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 				"projectPath": chunk.ProjectPath,
 				"updated_at":  time.Now().Format(time.RFC3339),
 			}
-			
+
 			_, err = tx.Run(
 				`MERGE (c:Chunk {id: $id})
 				 ON CREATE SET c.created_at = datetime()
@@ -991,10 +998,10 @@ func (r *Neo4jRAG) storeChunks(chunks []CodeChunk, filePath, projectPath string)
 				return nil, err
 			}
 		}
-		
+
 		return nil, nil
 	})
-	
+
 	return err
 }
 
@@ -1007,67 +1014,67 @@ func (r *Neo4jRAG) SearchCode(query string, limit int) ([]CodeChunk, error) {
 		fmt.Printf("Error generating embedding: %v\n", err)
 		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
 	}
-	
+
 	if len(embeddings) == 0 || len(embeddings[0]) == 0 {
 		fmt.Println("Received empty embedding for query")
 		return nil, fmt.Errorf("received empty embedding for query")
 	}
-	
+
 	fmt.Printf("Embedding generated successfully, length: %d\n", len(embeddings[0]))
 	queryEmbedding := embeddings[0]
-	
+
 	// Search Neo4j
 	fmt.Println("Searching Neo4j with similarity threshold > 0.1...")
 	session := r.driver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
-	
+
 	result, err := session.ReadTransaction(func(tx neo4j.Transaction) (interface{}, error) {
 		// First check if the database has chunks
-			fmt.Println("Checking database content...")
-			testResult, testErr := tx.Run(
-				`MATCH (c:Chunk) RETURN count(c) as count`,
-				map[string]interface{}{},
-			)
-			
-			if testErr != nil {
-				fmt.Printf("Database check failed: %v\n", testErr)
-				return nil, testErr
+		fmt.Println("Checking database content...")
+		testResult, testErr := tx.Run(
+			`MATCH (c:Chunk) RETURN count(c) as count`,
+			map[string]interface{}{},
+		)
+
+		if testErr != nil {
+			fmt.Printf("Database check failed: %v\n", testErr)
+			return nil, testErr
+		}
+
+		var chunkCount int64 = 0
+		if testResult.Next() {
+			count, _ := testResult.Record().Get("count")
+			chunkCount = count.(int64)
+			fmt.Printf("Database contains %v chunks\n", chunkCount)
+
+			// If count is 0, no data was indexed
+			if chunkCount == 0 {
+				fmt.Println("No chunks found in database. Please run indexing first.")
+				return []CodeChunk{}, nil
 			}
-			
-			var chunkCount int64 = 0
-			if testResult.Next() {
-				count, _ := testResult.Record().Get("count")
-				chunkCount = count.(int64)
-				fmt.Printf("Database contains %v chunks\n", chunkCount)
-				
-				// If count is 0, no data was indexed
-				if chunkCount == 0 {
-					fmt.Println("No chunks found in database. Please run indexing first.")
-					return []CodeChunk{}, nil
-				}
-			} else {
-				fmt.Println("Could not get chunk count from database")
-			}
-			
-			// Check if GDS library is installed and the vector index exists
-			fmt.Println("Checking GDS library status...")
-			gdsResult, gdsErr := tx.Run(
-				`CALL gds.list() YIELD name RETURN count(name) as count`,
-				map[string]interface{}{},
-			)
-			
-			if gdsErr != nil {
-				fmt.Printf("GDS library check failed: %v\n", gdsErr)
-				fmt.Println("The Graph Data Science library might not be installed or configured properly.")
-			} else if gdsResult.Next() {
-				gdsCount, _ := gdsResult.Record().Get("count")
-				fmt.Printf("GDS library has %v procedures available\n", gdsCount)
-			}
-			
-			// Now try the vector similarity search with a very low threshold
-			fmt.Println("Performing vector similarity search with threshold 0.1...")
-			result, err := tx.Run(
-				`MATCH (c:Chunk)
+		} else {
+			fmt.Println("Could not get chunk count from database")
+		}
+
+		// Check if GDS library is installed and the vector index exists
+		fmt.Println("Checking GDS library status...")
+		gdsResult, gdsErr := tx.Run(
+			`CALL gds.list() YIELD name RETURN count(name) as count`,
+			map[string]interface{}{},
+		)
+
+		if gdsErr != nil {
+			fmt.Printf("GDS library check failed: %v\n", gdsErr)
+			fmt.Println("The Graph Data Science library might not be installed or configured properly.")
+		} else if gdsResult.Next() {
+			gdsCount, _ := gdsResult.Record().Get("count")
+			fmt.Printf("GDS library has %v procedures available\n", gdsCount)
+		}
+
+		// Now try the vector similarity search with a very low threshold
+		fmt.Println("Performing vector similarity search with threshold 0.1...")
+		result, err := tx.Run(
+			`MATCH (c:Chunk)
 				 WITH c, gds.similarity.cosine(c.embedding, $embedding) AS vectorScore
 				 
 				 // Apply basic similarity threshold
@@ -1097,20 +1104,20 @@ func (r *Neo4jRAG) SearchCode(query string, limit int) ([]CodeChunk, error) {
 				 // Order by final score and limit results
 				 ORDER BY score DESC
 				 LIMIT $limit`,
-				map[string]interface{}{
-					"embedding": queryEmbedding,
-					"limit":     limit,
-				},
-			)
-		
+			map[string]interface{}{
+				"embedding": queryEmbedding,
+				"limit":     limit,
+			},
+		)
+
 		if err != nil {
 			return nil, err
 		}
-		
+
 		chunks := []CodeChunk{}
 		for result.Next() {
 			record := result.Record()
-			
+
 			id, _ := record.Get("c.id")
 			content, _ := record.Get("c.content")
 			filePath, _ := record.Get("c.file_path")
@@ -1121,7 +1128,7 @@ func (r *Neo4jRAG) SearchCode(query string, limit int) ([]CodeChunk, error) {
 			signature, _ := record.Get("c.signature")
 			language, _ := record.Get("c.language")
 			score, _ := record.Get("score")
-			
+
 			chunk := CodeChunk{
 				ID:         id.(string),
 				Content:    content.(string),
@@ -1132,26 +1139,26 @@ func (r *Neo4jRAG) SearchCode(query string, limit int) ([]CodeChunk, error) {
 				Name:       name.(string),
 				Language:   language.(string),
 			}
-			
+
 			if signature != nil {
 				chunk.Signature = signature.(string)
 			}
-			
+
 			// Save the score in the chunk
 			chunk.Score = score.(float64)
-			
+
 			r.logger.Printf("Found chunk with score %f: %s\n", score.(float64), chunk.Name)
 			chunks = append(chunks, chunk)
 		}
-		
+
 		return chunks, nil
 	})
-	
+
 	if err != nil {
 		fmt.Printf("Neo4j search failed: %v\n", err)
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
-	
+
 	chunks := result.([]CodeChunk)
 	fmt.Printf("Search complete. Found %d matching chunks\n", len(chunks))
 	return chunks, nil
@@ -1166,23 +1173,23 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 		fmt.Printf("Error generating embedding: %v\n", err)
 		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
 	}
-	
+
 	if len(embeddings) == 0 || len(embeddings[0]) == 0 {
 		fmt.Println("Received empty embedding for query")
 		return nil, fmt.Errorf("received empty embedding for query")
 	}
-	
+
 	fmt.Printf("Embedding generated successfully, length: %d\n", len(embeddings[0]))
 	queryEmbedding := embeddings[0]
-	
+
 	// Extract keywords for potential keyword search
 	keywords := extractKeywords(query)
-	
+
 	// Search Neo4j
 	fmt.Printf("Searching Neo4j with similarity threshold > %.2f...\n", minScore)
 	session := r.driver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
-	
+
 	result, err := session.ReadTransaction(func(tx neo4j.Transaction) (interface{}, error) {
 		// First check if the database has chunks
 		fmt.Println("Checking database content...")
@@ -1190,18 +1197,18 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 			`MATCH (c:Chunk) RETURN count(c) as count`,
 			map[string]interface{}{},
 		)
-		
+
 		if testErr != nil {
 			fmt.Printf("Database check failed: %v\n", testErr)
 			return nil, testErr
 		}
-		
+
 		var chunkCount int64 = 0
 		if testResult.Next() {
 			count, _ := testResult.Record().Get("count")
 			chunkCount = count.(int64)
 			fmt.Printf("Database contains %v chunks\n", chunkCount)
-			
+
 			// If count is 0, no data was indexed
 			if chunkCount == 0 {
 				fmt.Println("No chunks found in database. Please run indexing first.")
@@ -1210,15 +1217,15 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 		} else {
 			fmt.Println("Could not get chunk count from database")
 		}
-		
+
 		// Build the Cypher query with filters
 		cypherQuery := `MATCH (c:Chunk)`
-		
+
 		// Add language filter if specified
 		if len(languages) > 0 {
 			cypherQuery += ` WHERE c.language IN $languages`
 		}
-		
+
 		// Add path filter if specified
 		if len(pathFilters) > 0 {
 			if len(languages) > 0 {
@@ -1226,7 +1233,7 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 			} else {
 				cypherQuery += ` WHERE`
 			}
-			
+
 			pathConditions := []string{}
 			for i := range pathFilters {
 				// Use pattern index for parameter name
@@ -1234,7 +1241,7 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 			}
 			cypherQuery += ` (` + strings.Join(pathConditions, ` OR `) + `)`
 		}
-		
+
 		// Add keyword search if enabled
 		if useKeywords && len(keywords) > 0 {
 			keywordCondition := ``
@@ -1243,21 +1250,21 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 			} else {
 				keywordCondition += ` WHERE (`
 			}
-			
+
 			keywordPatterns := []string{}
 			for i, keyword := range keywords {
 				if len(keyword) > 3 { // Only use keywords with more than 3 characters
-					keywordPatterns = append(keywordPatterns, 
+					keywordPatterns = append(keywordPatterns,
 						fmt.Sprintf(`c.content CONTAINS $keyword%d`, i))
 				}
 			}
-			
+
 			if len(keywordPatterns) > 0 {
 				keywordCondition += strings.Join(keywordPatterns, ` OR `) + `)`
 				cypherQuery += keywordCondition
 			}
 		}
-		
+
 		// Add vector similarity calculation and improved scoring
 		cypherQuery += `
 		WITH c, gds.similarity.cosine(c.embedding, $embedding) AS vectorScore
@@ -1289,24 +1296,24 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 		// Order by final score and limit results
 		ORDER BY score DESC
 		LIMIT $limit`
-		
+
 		// Prepare parameters
 		parameters := map[string]interface{}{
 			"embedding": queryEmbedding,
 			"minScore":  minScore,
 			"limit":     limit,
 		}
-		
+
 		// Add language parameters if specified
 		if len(languages) > 0 {
 			parameters["languages"] = languages
 		}
-		
+
 		// Add path filter parameters if specified
 		for i, pattern := range pathFilters {
 			parameters[fmt.Sprintf("pathPattern%d", i)] = globToRegex(pattern)
 		}
-		
+
 		// Add keyword parameters if enabled
 		if useKeywords && len(keywords) > 0 {
 			for i, keyword := range keywords {
@@ -1315,18 +1322,18 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 				}
 			}
 		}
-		
+
 		// Execute the query
 		result, err := tx.Run(cypherQuery, parameters)
-		
+
 		if err != nil {
 			return nil, err
 		}
-		
+
 		chunks := []CodeChunk{}
 		for result.Next() {
 			record := result.Record()
-			
+
 			id, _ := record.Get("c.id")
 			content, _ := record.Get("c.content")
 			filePath, _ := record.Get("c.file_path")
@@ -1337,7 +1344,7 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 			signature, _ := record.Get("c.signature")
 			language, _ := record.Get("c.language")
 			score, _ := record.Get("score")
-			
+
 			chunk := CodeChunk{
 				ID:         id.(string),
 				Content:    content.(string),
@@ -1348,26 +1355,26 @@ func (r *Neo4jRAG) SearchCodeAdvanced(query string, limit int, languages []strin
 				Name:       name.(string),
 				Language:   language.(string),
 			}
-			
+
 			if signature != nil {
 				chunk.Signature = signature.(string)
 			}
-			
+
 			// Save the score in the chunk
 			chunk.Score = score.(float64)
-			
+
 			r.logger.Printf("Found chunk with score %f: %s\n", score.(float64), chunk.ID)
 			chunks = append(chunks, chunk)
 		}
-		
+
 		return chunks, nil
 	})
-	
+
 	if err != nil {
 		fmt.Printf("Neo4j search failed: %v\n", err)
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
-	
+
 	chunks := result.([]CodeChunk)
 	fmt.Printf("Search complete. Found %d matching chunks\n", len(chunks))
 	return chunks, nil
@@ -1380,81 +1387,124 @@ func (r *Neo4jRAG) QueryLLM(query string, maxTokens int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to search for relevant chunks: %w", err)
 	}
-	
+
 	// Format prompt with context
+	r.logger.Printf("Formatting prompt with %d code chunks", len(chunks))
 	prompt := "Based on the following code snippets:\n\n"
-	
+
 	for i, chunk := range chunks {
 		prompt += fmt.Sprintf("SNIPPET %d (%s, %s):\n```%s\n%s\n```\n\n",
 			i+1, chunk.FilePath, chunk.EntityType, strings.ToLower(chunk.Language), chunk.Content)
 	}
-	
+
 	prompt += fmt.Sprintf("Answer the following question: %s", query)
-	
-	r.logger.Println("Sending query to LLM")
-	
-	// Send to LLM
+
+	// Increment LLM query counter for logging
+	r.llmQueryCounter++
+
+	// Log every 5th query or first query
+	if r.llmQueryCounter == 1 || r.llmQueryCounter%5 == 0 {
+		r.logger.Printf("Sending query #%d to LLM (prompt length: %d characters)",
+			r.llmQueryCounter, len(prompt))
+	}
+
+	// Send to LLM - preserve newlines for code snippets
 	req := LLMRequest{
-		Prompt:      prompt,
+		Prompt:      prompt, // Use the original prompt with newlines preserved
 		MaxTokens:   maxTokens,
 		Temperature: 0.2,
 	}
-	
+
 	reqBody, err := json.Marshal(req)
 	if err != nil {
+		r.consecutiveLLMFailures++
+		r.logger.Printf("Error #%d marshaling LLM request: %v", r.consecutiveLLMFailures, err)
 		return "", err
 	}
 	
+	// Always log the JSON request being sent to help diagnose issues
+	r.logger.Printf("Sending LLM request to %s: %s", r.config.LLMServerURL, string(reqBody))
+
 	// Call LLM server
 	resp, err := http.Post(r.config.LLMServerURL, "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
+		r.consecutiveLLMFailures++
+		// Always log the first failure in a sequence
+		if r.consecutiveLLMFailures == 1 {
+			r.logger.Printf("Error connecting to LLM server: %v", err)
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
-	
+
+	// Check for non-200 status code
+	if resp.StatusCode != http.StatusOK {
+		r.consecutiveLLMFailures++
+		
+		// Read error response body to get more details
+		errorBody, _ := io.ReadAll(resp.Body)
+		
+		// Always log the first failure in a sequence with detailed error information
+		if r.consecutiveLLMFailures == 1 {
+			r.logger.Printf("LLM server returned non-OK status: %d, Error: %s", resp.StatusCode, string(errorBody))
+		}
+		return "", fmt.Errorf("LLM server returned status code %d: %s", resp.StatusCode, string(errorBody))
+	}
+
+	// If we got here, we succeeded after possible failures
+	if r.consecutiveLLMFailures > 0 {
+		r.logger.Printf("LLM server recovered after %d consecutive failures", r.consecutiveLLMFailures)
+		r.consecutiveLLMFailures = 0
+	}
+
 	// Parse response
 	var llmResp LLMResponse
 	err = json.NewDecoder(resp.Body).Decode(&llmResp)
 	if err != nil {
+		r.logger.Printf("Error parsing LLM response: %v", err)
 		return "", err
 	}
-	
-	r.logger.Printf("LLM response received, tokens used: %d\n", llmResp.TokensUsed)
-	
+
+	// Log every 5th response or first response
+	if r.llmQueryCounter == 1 || r.llmQueryCounter%5 == 0 {
+		r.logger.Printf("LLM response #%d received, tokens used: %d, response length: %d characters",
+			r.llmQueryCounter, llmResp.TokensUsed, len(llmResp.Text))
+	}
+
 	return llmResp.Text, nil
 }
 
 // getLanguageFromExt gets the language name from file extension
 func getLanguageFromExt(ext string) string {
 	ext = strings.ToLower(ext)
-	
+
 	langMap := map[string]string{
-		".go":   "Go",
-		".py":   "Python",
-		".js":   "JavaScript",
-		".ts":   "TypeScript",
-		".java": "Java",
-		".c":    "C",
-		".cpp":  "C++",
-		".h":    "C/C++ Header",
-		".hpp":  "C++ Header",
-		".cs":   "C#",
-		".php":  "PHP",
-		".rb":   "Ruby",
-		".rs":   "Rust",
+		".go":    "Go",
+		".py":    "Python",
+		".js":    "JavaScript",
+		".ts":    "TypeScript",
+		".java":  "Java",
+		".c":     "C",
+		".cpp":   "C++",
+		".h":     "C/C++ Header",
+		".hpp":   "C++ Header",
+		".cs":    "C#",
+		".php":   "PHP",
+		".rb":    "Ruby",
+		".rs":    "Rust",
 		".swift": "Swift",
-		".kt":   "Kotlin",
-		".sh":   "Shell",
-		".html": "HTML",
-		".css":  "CSS",
-		".sql":  "SQL",
-		".md":   "Markdown",
+		".kt":    "Kotlin",
+		".sh":    "Shell",
+		".html":  "HTML",
+		".css":   "CSS",
+		".sql":   "SQL",
+		".md":    "Markdown",
 	}
-	
+
 	if lang, ok := langMap[ext]; ok {
 		return lang
 	}
-	
+
 	return "Unknown"
 }
 
@@ -1462,87 +1512,87 @@ func getLanguageFromExt(ext string) string {
 func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMResponse bool, limit int, explicitLanguages []string, explicitPathFilters []string, explicitMinScore float64, explicitUseKeywords bool) {
 	fmt.Println("\nQuery:", query)
 	fmt.Println("\nSearching for relevant code...")
-	
+
 	// Auto-detect language filters from query if not explicitly provided
 	languages := explicitLanguages
 	if len(languages) == 0 {
 		languages = []string{}
 		queryLower := strings.ToLower(query)
-		
+
 		languageKeywords := map[string]string{
-		"golang":      "Go",
-		"go code":     "Go",
-		"python":      "Python",
-		"py":          "Python",
-		"javascript":  "JavaScript",
-		"js":          "JavaScript",
-		"typescript":  "TypeScript",
-		"ts":          "TypeScript",
-		"java":        "Java",
-		"c#":          "C#",
-		"csharp":      "C#",
-		"c++":         "C++",
-		"cpp":         "C++",
-		"ruby":        "Ruby",
-		"rust":        "Rust",
-		"php":         "PHP",
-		"swift":       "Swift",
-		"kotlin":      "Kotlin",
-		"scala":       "Scala",
-		"shell":       "Shell",
-		"bash":        "Shell",
-		"sql":         "SQL",
-	}
-	
-	// Check for language filters in the query
-	for keyword, language := range languageKeywords {
-		if strings.Contains(queryLower, keyword) {
-			languages = append(languages, language)
+			"golang":     "Go",
+			"go code":    "Go",
+			"python":     "Python",
+			"py":         "Python",
+			"javascript": "JavaScript",
+			"js":         "JavaScript",
+			"typescript": "TypeScript",
+			"ts":         "TypeScript",
+			"java":       "Java",
+			"c#":         "C#",
+			"csharp":     "C#",
+			"c++":        "C++",
+			"cpp":        "C++",
+			"ruby":       "Ruby",
+			"rust":       "Rust",
+			"php":        "PHP",
+			"swift":      "Swift",
+			"kotlin":     "Kotlin",
+			"scala":      "Scala",
+			"shell":      "Shell",
+			"bash":       "Shell",
+			"sql":        "SQL",
 		}
+
+		// Check for language filters in the query
+		for keyword, language := range languageKeywords {
+			if strings.Contains(queryLower, keyword) {
+				languages = append(languages, language)
+			}
 		}
 	}
-	
+
 	// Extract path filters from query if not explicitly provided
 	pathFilters := explicitPathFilters
 	if len(pathFilters) == 0 {
 		pathFilters = []string{}
 		queryLower := strings.ToLower(query)
 		pathPatterns := []string{
-		"in directory", "in dir", "in folder", "in path",
-		"from directory", "from dir", "from folder", "from path",
-	}
-	
-	for _, pattern := range pathPatterns {
-		if idx := strings.Index(queryLower, pattern); idx != -1 {
-			// Extract the path after the pattern
-			pathStart := idx + len(pattern)
-			if pathStart < len(query) {
-				pathText := query[pathStart:]
-				// Find the end of the path (next punctuation or end of string)
-				pathEnd := strings.IndexAny(pathText, ".,:;!?")
-				if pathEnd == -1 {
-					pathEnd = len(pathText)
-				}
-				
-				if pathEnd > 0 {
-					path := strings.Trim(pathText[:pathEnd], " \t\"'")
-					if path != "" {
-						// Add wildcard if needed
-						if !strings.Contains(path, "*") {
-							path = "*" + path + "*"
+			"in directory", "in dir", "in folder", "in path",
+			"from directory", "from dir", "from folder", "from path",
+		}
+
+		for _, pattern := range pathPatterns {
+			if idx := strings.Index(queryLower, pattern); idx != -1 {
+				// Extract the path after the pattern
+				pathStart := idx + len(pattern)
+				if pathStart < len(query) {
+					pathText := query[pathStart:]
+					// Find the end of the path (next punctuation or end of string)
+					pathEnd := strings.IndexAny(pathText, ".,:;!?")
+					if pathEnd == -1 {
+						pathEnd = len(pathText)
+					}
+
+					if pathEnd > 0 {
+						path := strings.Trim(pathText[:pathEnd], " \t\"'")
+						if path != "" {
+							// Add wildcard if needed
+							if !strings.Contains(path, "*") {
+								path = "*" + path + "*"
+							}
+							pathFilters = append(pathFilters, path)
 						}
-						pathFilters = append(pathFilters, path)
 					}
 				}
 			}
 		}
-		}
 	}
-	
+
 	// Use provided parameters or defaults
 	minScore := explicitMinScore
 	useKeywords := explicitUseKeywords
-	
+
 	// Log the search parameters if not in JSON mode
 	if !jsonOutput {
 		if len(languages) > 0 {
@@ -1552,14 +1602,14 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 			fmt.Printf("Path filters: %v\n", pathFilters)
 		}
 	}
-	
+
 	// Use the advanced search
 	chunks, err := rag.SearchCodeAdvanced(query, limit, languages, pathFilters, minScore, useKeywords)
 	if err != nil {
 		fmt.Printf("Error searching for code: %v\n", err)
 		return
 	}
-	
+
 	// Handle JSON output mode
 	if jsonOutput {
 		// Marshal chunks to JSON
@@ -1568,12 +1618,12 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 			fmt.Printf("Error marshaling to JSON: %v\n", err)
 			return
 		}
-		
+
 		// Print JSON output
 		fmt.Println(string(jsonData))
 		return
 	}
-	
+
 	// Display results with more context in normal mode
 	if len(chunks) == 0 {
 		fmt.Println("No relevant code found")
@@ -1581,7 +1631,7 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 		fmt.Println("\nRelevant code chunks:")
 		for i, chunk := range chunks {
 			fmt.Printf("\n--- Chunk %d ---\n", i+1)
-			
+
 			// Display detailed file information with absolute path
 			absPath, err := filepath.Abs(chunk.FilePath)
 			if err != nil {
@@ -1589,34 +1639,34 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 			}
 			fmt.Printf("Absolute Path: %s\n", absPath)
 			fmt.Printf("Relative Path: %s\n", chunk.FilePath)
-			
+
 			// Get directory and filename separately
 			dir := filepath.Dir(absPath)
 			filename := filepath.Base(absPath)
 			fmt.Printf("Directory: %s\n", dir)
 			fmt.Printf("Filename: %s\n", filename)
-			
+
 			// Display line range
 			fmt.Printf("Lines: %d-%d\n", chunk.StartLine, chunk.EndLine)
-			
+
 			// Display entity information
 			fmt.Printf("Type: %s", chunk.EntityType)
 			if chunk.Name != "" {
 				fmt.Printf(" - %s", chunk.Name)
 			}
-			
+
 			// Display language
 			if chunk.Language != "" {
 				fmt.Printf("\nLanguage: %s", chunk.Language)
 			}
-			
+
 			// Display signature if available
 			if chunk.Signature != "" {
 				fmt.Printf("\nSignature: %s", chunk.Signature)
 			}
-			
+
 			fmt.Println("\n\nContent Preview:")
-			
+
 			// Print snippet of code (show more lines for better context)
 			lines := strings.Split(chunk.Content, "\n")
 			maxLines := 15 // Increased from 8 to 15 lines
@@ -1627,30 +1677,30 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 				fmt.Printf("%d: %s\n", chunk.StartLine+j, lines[j])
 			}
 			if len(lines) > maxLines {
-				fmt.Printf("... (%d more lines not shown)\n", len(lines) - maxLines)
+				fmt.Printf("... (%d more lines not shown)\n", len(lines)-maxLines)
 			}
-			
+
 			// Add a separator between chunks
 			fmt.Println("\n" + strings.Repeat("-", 80))
 		}
 	}
-	
+
 	// Only generate LLM answer if requested
 	if !generateLLMResponse {
 		return
 	}
-	
+
 	// Generate answer using LLM
 	fmt.Println("\nGenerating answer...")
-	
+
 	// Create a detailed summary of search results to include in the final answer
 	searchResultsSummary := "\nSearch Results Summary:\n"
 	for i, chunk := range chunks {
 		absPath, _ := filepath.Abs(chunk.FilePath)
-		
+
 		// Add a separator line for better readability
 		searchResultsSummary += fmt.Sprintf("\n%s\n", strings.Repeat("-", 80))
-		
+
 		// Add detailed file information
 		searchResultsSummary += fmt.Sprintf("\n%d. MATCH DETAILS:\n", i+1)
 		searchResultsSummary += fmt.Sprintf("   Similarity Score: %.6f\n", chunk.Score)
@@ -1658,7 +1708,7 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 		searchResultsSummary += fmt.Sprintf("   Directory: %s\n", filepath.Dir(absPath))
 		searchResultsSummary += fmt.Sprintf("   Filename: %s\n", filepath.Base(absPath))
 		searchResultsSummary += fmt.Sprintf("   Lines: %d-%d\n", chunk.StartLine, chunk.EndLine)
-		
+
 		// Add entity information if available
 		if chunk.EntityType != "" {
 			searchResultsSummary += fmt.Sprintf("   Type: %s\n", chunk.EntityType)
@@ -1669,23 +1719,23 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 		if chunk.Language != "" {
 			searchResultsSummary += fmt.Sprintf("   Language: %s\n", chunk.Language)
 		}
-		
+
 		// Add a snippet of the content
 		lines := strings.Split(chunk.Content, "\n")
 		previewLines := 5
 		if len(lines) < previewLines {
 			previewLines = len(lines)
 		}
-		
+
 		searchResultsSummary += "\n   Content Preview:\n"
 		for j := 0; j < previewLines; j++ {
 			searchResultsSummary += fmt.Sprintf("   %d: %s\n", chunk.StartLine+j, lines[j])
 		}
 		if len(lines) > previewLines {
-			searchResultsSummary += fmt.Sprintf("   ... (%d more lines)\n", len(lines) - previewLines)
+			searchResultsSummary += fmt.Sprintf("   ... (%d more lines)\n", len(lines)-previewLines)
 		}
 	}
-	
+
 	// Get answer from LLM
 	answer, err := rag.QueryLLM(query, 1000)
 	if err != nil {
@@ -1701,11 +1751,12 @@ func processQuery(rag *Neo4jRAG, query string, jsonOutput bool, generateLLMRespo
 		fmt.Println(answer)
 	}
 }
+
 // extractKeywords extracts important keywords from a query string
 func extractKeywords(query string) []string {
 	// Split the query into words
 	words := strings.Fields(strings.ToLower(query))
-	
+
 	// Filter out common stop words
 	stopWords := map[string]bool{
 		"a": true, "an": true, "the": true, "and": true, "or": true, "but": true,
@@ -1720,20 +1771,20 @@ func extractKeywords(query string) []string {
 		"same": true, "so": true, "than": true, "too": true, "very": true, "can": true,
 		"will": true, "just": true, "should": true, "now": true,
 	}
-	
+
 	keywords := []string{}
 	for _, word := range words {
 		// Remove punctuation
 		word = strings.Trim(word, ".,;:!?()[]{}-\"'`")
-		
+
 		// Skip empty words, stop words, and single characters
 		if word == "" || stopWords[word] || len(word) <= 1 {
 			continue
 		}
-		
+
 		keywords = append(keywords, word)
 	}
-	
+
 	return keywords
 }
 
@@ -1741,14 +1792,14 @@ func extractKeywords(query string) []string {
 func globToRegex(pattern string) string {
 	// Escape special regex characters
 	regex := regexp.QuoteMeta(pattern)
-	
+
 	// Convert glob wildcards to regex wildcards
 	regex = strings.ReplaceAll(regex, "\\*", ".*")
 	regex = strings.ReplaceAll(regex, "\\?", ".")
-	
+
 	// Add start and end anchors
 	regex = "^" + regex + "$"
-	
+
 	return regex
 }
 
@@ -1763,24 +1814,24 @@ func main() {
 	chunkOverlap := flag.Int("chunk-overlap", 100, "Chunk overlap in characters")
 	codeDir := flag.String("code-dir", "", "Directory to index")
 	dbName := flag.String("db-name", "coderag", "Database name")
-	
+
 	indexCmd := flag.Bool("index", false, "Index code directory")
 	queryCmd := flag.Bool("query", false, "Query the system")
 	queryString := flag.String("query-string", "", "Query string to search for (used with --query)")
-	
+
 	// Advanced search options
 	languages := flag.String("languages", "", "Comma-separated list of languages to filter by")
 	pathFilters := flag.String("path-filters", "", "Comma-separated list of path patterns to filter by")
 	minScore := flag.Float64("min-score", 0.1, "Minimum similarity score (0.0-1.0)")
 	useKeywords := flag.Bool("use-keywords", true, "Use keyword matching for better results")
 	limit := flag.Int("limit", 5, "Maximum number of results to return")
-	
+
 	// Output options
 	jsonOutput := flag.Bool("json-output", false, "Output results in JSON format")
 	llmResponse := flag.Bool("llm-response", false, "Generate LLM response for the query")
-	
+
 	flag.Parse()
-	
+
 	// Configure the RAG system
 	config := Config{
 		Neo4jURI:      *neo4jURI,
@@ -1793,26 +1844,26 @@ func main() {
 		CodeDir:       *codeDir,
 		DbName:        *dbName,
 	}
-	
+
 	// Create the Neo4j RAG instance
 	rag, err := NewNeo4jRAG(config)
 	if err != nil {
 		log.Fatalf("Failed to initialize Neo4j RAG: %v", err)
 	}
 	defer rag.Close()
-	
+
 	// Handle commands
 	if *indexCmd {
 		if *codeDir == "" {
 			log.Fatal("Please specify a directory to index with --code-dir")
 		}
-		
+
 		fmt.Printf("Indexing directory: %s\n", *codeDir)
 		err := rag.IndexDirectory(*codeDir)
 		if err != nil {
 			log.Fatalf("Failed to index directory: %v", err)
 		}
-		
+
 		fmt.Println("Indexing complete")
 	} else if *queryCmd {
 		// Check if query string was provided as argument
@@ -1820,37 +1871,37 @@ func main() {
 			// Use the provided query string directly
 			query := *queryString
 			fmt.Printf("\nQuery: %s\n", query)
-			
+
 			// Parse advanced search options
 			var langList []string
 			if *languages != "" {
 				langList = strings.Split(*languages, ",")
 			}
-			
+
 			var pathList []string
 			if *pathFilters != "" {
 				pathList = strings.Split(*pathFilters, ",")
 			}
-			
+
 			// Process the query
 			processQuery(rag, query, *jsonOutput, *llmResponse, *limit, langList, pathList, *minScore, *useKeywords)
 		} else {
 			// Start interactive query mode
 			reader := bufio.NewReader(os.Stdin)
-			
+
 			for {
 				fmt.Print("\nEnter your query (or 'exit' to quit): ")
 				query, _ := reader.ReadString('\n')
 				query = strings.TrimSpace(query)
-				
+
 				if query == "exit" {
 					break
 				}
-				
+
 				if query == "" {
 					continue
 				}
-				
+
 				// Process the query
 				processQuery(rag, query, *jsonOutput, *llmResponse, *limit, []string{}, []string{}, *minScore, *useKeywords)
 			}
